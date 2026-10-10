@@ -13,6 +13,11 @@ const PORT = Number(process.env.PORT || 3000);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET || '';
 const ORIGIN = process.env.PUBLIC_ORIGIN || `http://localhost:${PORT}`;
+const IS_VERCEL = process.env.VERCEL === '1';
+const KV_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+const KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const KV_STATE_KEY = 'lucky-quiz:state:v1';
+const KV_LOCK_KEY = 'lucky-quiz:state-lock:v1';
 const voucherCodes = ['999-489-654-733','999-370-349-509','999-386-460-696','999-387-395-702','999-310-220-632','999-124-998-613','999-105-596-671','999-848-216-413','999-123-628-442'];
 const seed = { config:{name:'Vòng quay vị ngon',startAt:'2026-01-01T00:00:00+07:00',endAt:'2027-01-01T00:00:00+07:00',requireCorrect:false,fields:{name:true,phone:true,email:false},privacy:'Thông tin được sử dụng để xác minh lượt chơi và trao voucher theo thể lệ chương trình.'}, questions:[
  {id:'q1',type:'single',text:'Món gà ngon bắt đầu từ điều gì?',answers:['Nguyên liệu tươi ngon','May mắn','Một chiếc đĩa đẹp','Bí mật của đầu bếp'],correct:0},
@@ -21,9 +26,36 @@ const seed = { config:{name:'Vòng quay vị ngon',startAt:'2026-01-01T00:00:00+
 let state;
 let saveQueue=Promise.resolve();
 const sessions=new Map(), startAttempts=new Map(), answerAttempts=new Map(), configAttempts=new Map(), spins=new Map(), adminAttempts=new Map();
-await mkdir(DATA,{recursive:true});
-try { state=JSON.parse(await readFile(DB,'utf8')); } catch { state=structuredClone(seed); await persist(); }
-async function persist(){ saveQueue=saveQueue.then(()=>writeFile(DB,JSON.stringify(state,null,2),'utf8')); return saveQueue; }
+if(!IS_VERCEL){
+ await mkdir(DATA,{recursive:true});
+ try { state=JSON.parse(await readFile(DB,'utf8')); } catch { state=structuredClone(seed); await persist(); }
+}else state=structuredClone(seed);
+async function persist(){ if(IS_VERCEL)return; saveQueue=saveQueue.then(()=>writeFile(DB,JSON.stringify(state,null,2),'utf8')); return saveQueue; }
+async function redisCommand(...command){
+ const response=await fetch(KV_URL,{method:'POST',headers:{authorization:`Bearer ${KV_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(command)});
+ const result=await response.json();if(!response.ok||result.error)throw new Error(`Storage request failed: ${result.error||response.status}`);return result.result;
+}
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function restoreMap(map,entries){map.clear();for(const [key,value] of entries||[])map.set(key,value);}
+async function withRemoteState(action){
+ if(!KV_URL||!KV_TOKEN)return {status:503,body:{error:'Vercel storage is not configured. Add UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.'}};
+ if(!ADMIN_PASSWORD||SECRET.length<32)return {status:503,body:{error:'Admin credentials are not configured. Add ADMIN_PASSWORD and a SESSION_SECRET with at least 32 characters.'}};
+ const lockToken=randomBytes(24).toString('hex');let locked=false;
+ for(let i=0;i<60;i++){const result=await redisCommand('SET',KV_LOCK_KEY,lockToken,'NX','PX',25000);if(result==='OK'){locked=true;break;}await sleep(100);}
+ if(!locked)return {status:503,body:{error:'Storage is busy. Please retry shortly.'}};
+ try{
+  const raw=await redisCommand('GET',KV_STATE_KEY);const saved=raw?JSON.parse(raw):null;
+  state=saved?.data||structuredClone(seed);
+  const maps=saved?.runtime||{};
+  restoreMap(sessions,maps.sessions);restoreMap(spins,maps.spins);restoreMap(startAttempts,maps.startAttempts);restoreMap(answerAttempts,maps.answerAttempts);restoreMap(configAttempts,maps.configAttempts);restoreMap(adminAttempts,maps.adminAttempts);
+  const result=await action();
+  const runtime={sessions:[...sessions],spins:[...spins],startAttempts:[...startAttempts],answerAttempts:[...answerAttempts],configAttempts:[...configAttempts],adminAttempts:[...adminAttempts]};
+  await redisCommand('SET',KV_STATE_KEY,JSON.stringify({data:state,runtime}));
+  return result;
+ }finally{
+  await redisCommand('EVAL',"if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",1,KV_LOCK_KEY,lockToken).catch(()=>{});
+ }
+}
 function event(type,detail={}){state.events.push({id:randomBytes(8).toString('hex'),type,at:new Date().toISOString(),...detail}); if(state.events.length>5000) state.events=state.events.slice(-5000);}
 function json(res,status,data){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'same-origin'});res.end(JSON.stringify(data));}
 function cookie(req,name){const c=req.headers.cookie||'';return c.split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='))?.slice(name.length+1)||'';}
@@ -31,14 +63,17 @@ function sign(v){return createHmac('sha256',SECRET).update(v).digest('hex');}
 function getSession(req){const tok=cookie(req,'lq_session');if(!tok)return null; const [id,sig]=tok.split('.'); if(!id||!sig||!safeEq(sig,sign(id)))return null; const s=sessions.get(id); if(s&&s.expires>Date.now())return s; sessions.delete(id);return null;}
 function safeEq(a,b){const aa=Buffer.from(String(a)),bb=Buffer.from(String(b));return aa.length===bb.length&&timingSafeEqual(aa,bb);}
 function csrf(req){const normal=getSession(req);const adminToken=cookie(req,'lq_admin'),[adminId,adminSig]=adminToken.split('.'),admin=adminId&&adminSig&&safeEq(adminSig,sign(adminId))?sessions.get(adminId):null;return req.headers['x-csrf-token']&&(normal?.csrf===req.headers['x-csrf-token']||admin?.csrf===req.headers['x-csrf-token']);}
-async function body(req){let s='';for await(const c of req){s+=c;if(s.length>20000)throw new Error('too_large');}return JSON.parse(s||'{}');}
+async function body(req){
+ if(req.body!==undefined){if(typeof req.body==='string')return JSON.parse(req.body||'{}');if(req.body&&typeof req.body==='object')return req.body;}
+ let s='';for await(const c of req){s+=c;if(s.length>20000)throw new Error('too_large');}return JSON.parse(s||'{}');
+}
 function limited(map,key,max,window){const now=Date.now(),a=(map.get(key)||[]).filter(t=>now-t<window);if(a.length>=max){map.set(key,a);return false;}a.push(now);map.set(key,a);return true;}
 function phoneOk(s){return /^0\d{9}$/.test(s);}
 function active(){const now=Date.now();return now>=Date.parse(state.config.startAt)&&now<Date.parse(state.config.endAt);}
 function publicConfig(){return {name:state.config.name,active:active(),endAt:state.config.endAt,fields:state.config.fields,privacy:state.config.privacy,questions:state.questions.map(({id,type,text,answers})=>({id,type,text,answers})),prizes:state.prizes.map(({id,name,subtitle,color})=>({id,name,subtitle,color}))};}
-const server=http.createServer(async(req,res)=>{
+async function routeRequest(req,res){
  try{
-  const url=new URL(req.url,ORIGIN),ip=(req.headers['x-forwarded-for']||req.socket.remoteAddress||'').split(',')[0].trim();
+  const forwarded=req.headers['x-forwarded-for'];const url=new URL(req.url,ORIGIN),ip=(Array.isArray(forwarded)?forwarded.join(','):forwarded||req.socket?.remoteAddress||'').split(',')[0].trim();
   if(req.method==='GET'&&url.pathname==='/api/config') return json(res,200,publicConfig());
   if(req.method==='POST'&&url.pathname==='/api/start'){
    if(!limited(startAttempts,ip,15,60000))return json(res,429,{error:'Bạn thao tác quá nhanh. Vui lòng thử lại sau.'});
@@ -104,5 +139,12 @@ const server=http.createServer(async(req,res)=>{
   }
   json(res,404,{error:'Not found'});
  }catch(e){console.error(e);json(res,e.message==='too_large'?413:500,{error:e.message==='too_large'?'Dữ liệu quá lớn':'Đã có lỗi máy chủ. Vui lòng thử lại.'});}
-});
-server.listen(PORT,()=>console.log(`Lucky Quiz running on ${ORIGIN}`));
+}
+export async function handle(req,res){
+ if(!IS_VERCEL)return routeRequest(req,res);
+ try{
+  const result=await withRemoteState(()=>routeRequest(req,res));
+  if(result?.status)return json(res,result.status,result.body);
+ }catch(error){console.error('Vercel function error:',error);if(!res.headersSent)return json(res,503,{error:'Temporary server or storage error. Check Vercel environment variables and retry.'});}
+}
+if(!IS_VERCEL)http.createServer(handle).listen(PORT,()=>console.log(`Lucky Quiz running on ${ORIGIN}`));

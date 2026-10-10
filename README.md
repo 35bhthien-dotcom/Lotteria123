@@ -33,6 +33,18 @@ Dữ liệu tham gia và voucher được lưu trong `data/store.json` (tự t�
 
 Dùng máy chủ Node.js 20+ có ổ đĩa bền vững; cấu hình biến `ADMIN_PASSWORD`, `SESSION_SECRET`, `PORT`, `PUBLIC_ORIGIN`. Bật HTTPS tại reverse proxy và đặt `NODE_ENV=production` để bật cookie Secure. Sao lưu dữ liệu định kỳ. Bản triển khai này phù hợp cho bản demo hoặc lưu lượng thấp trên một tiến trình máy chủ. Trước khi dùng cho chiến dịch thương mại quy mô lớn, cần chuyển kho JSON sang PostgreSQL với transaction/unique constraints, thêm cơ chế đăng nhập admin theo tài khoản và kiểm tra điều kiện đổi voucher với hệ thống bán hàng Lotteria. Không đặt nhiều tiến trình trên cùng tệp JSON.
 
+### Vercel
+
+Vercel serves the files in `public/` and routes `/api/*` to `api/[...path].mjs`. The serverless API does not start a long-running HTTP listener or read/write the deployment filesystem. It stores campaign state, voucher inventory, and sessions in Upstash Redis under one serialized state key and a short-lived distributed lock. This keeps the inventory check and voucher issue serialized across function instances.
+
+Before redeploying:
+
+1. Add the Upstash Redis integration to the Vercel project. It provides `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+2. Add `ADMIN_PASSWORD` and a random `SESSION_SECRET` (at least 32 characters) in Vercel Project Settings → Environment Variables for Production and Preview as needed.
+3. Redeploy the latest commit. The first API call initializes the demo campaign and the nine supplied voucher codes in Redis.
+
+If storage or security variables are missing, the API returns a clear `503` setup response instead of crashing the function. Keep these credentials private; never add them to source control.
+
 ## Kiểm tra thủ công
 
 Chạy `npm start`, hoàn thành luồng người chơi, kiểm tra một mã được hiển thị sau vòng quay và thử lại cùng số điện thoại. Đăng nhập `/admin.html`, xác nhận thống kê cập nhật, tải CSV và cấu hình kết thúc chương trình để kiểm tra trạng thái đóng. Không có bộ kiểm thử tự động đi kèm.
